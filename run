@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCANS_DIR="$ROOT_DIR/scans"
+STATE_FILE="$ROOT_DIR/.makeacrack_last_domain"
+
+# ---- helpers ----
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+banner() {
+  clear || true
+  if have_cmd figlet; then
+    figlet "makeAcrack"
+  else
+    echo "==============================="
+    echo "        makeAcrack"
+    echo "  (install 'figlet' for flair)"
+    echo "==============================="
+  fi
+  echo
+  echo "DISCLAIMER: This tool is for authorized security testing and research only."
+  echo "The creator and contributors are not responsible for misuse or damage."
+  echo
+}
+
+prompt_domain() {
+  # If we have a saved domain, offer it; else ask for new
+  if [[ -f "$STATE_FILE" ]]; then
+    local last_domain
+    last_domain="$(cat "$STATE_FILE" || true)"
+    if [[ -n "${last_domain}" ]]; then
+      echo "Select a domain option:"
+      echo "  1) Use last domain: ${last_domain}"
+      echo "  2) Enter a new domain"
+      echo "  3) Back"
+      read -rp "Enter choice [1-3]: " dchoice
+      case "$dchoice" in
+        1) DOMAIN="$last_domain" ;;
+        2) read -rp "Enter domain (e.g., example.com): " DOMAIN ;;
+        3) return 1 ;;
+        *) echo "Invalid choice." ; return 1 ;;
+      esac
+    else
+      read -rp "Enter domain (e.g., example.com): " DOMAIN
+    fi
+  else
+    read -rp "Enter domain (e.g., example.com): " DOMAIN
+  fi
+
+  DOMAIN="$(echo "$DOMAIN" | awk '{$1=$1};1')"
+  if [[ -z "${DOMAIN:-}" ]]; then
+    echo "No domain provided."
+    return 1
+  fi
+  echo "$DOMAIN" > "$STATE_FILE"
+  return 0
+}
+
+check_reqs() {
+  local missing=()
+  for cmd in python3 whois dig; do
+    if ! have_cmd "$cmd"; then missing+=("$cmd"); fi
+  done
+  if ((${#missing[@]})); then
+    echo "Missing required tools: ${missing[*]}"
+    echo "Please install them and re-run. Example on Debian/Kali:"
+    echo "  sudo apt-get update && sudo apt-get install -y python3 whois dnsutils figlet"
+    exit 1
+  fi
+}
+
+run_scan() {
+  local which="$1"
+  case "$which" in
+    1)
+      echo
+      echo "Starting Surface Scan (scan1.py) on: ${DOMAIN}"
+      echo "-----------------------------------------"
+      echo
+      python3 "$SCANS_DIR/scan1.py" --domain "$DOMAIN"
+      ;;
+    2)
+      echo
+      echo "Starting Subdomain Scan (scan2.py) on: ${DOMAIN}"
+      echo "-----------------------------------------"
+      echo
+      python3 "$SCANS_DIR/scan2.py" --domain "$DOMAIN"
+      ;;
+    *)
+      echo "Unknown scan choice."
+      ;;
+  esac
+  echo
+  read -rp "Press Enter to return to the main menu..." _
+}
+
+main_menu() {
+  while true; do
+    banner
+
+    # Load saved domain if present
+    if [[ -z "${DOMAIN:-}" && -f "$STATE_FILE" ]]; then
+      DOMAIN="$(cat "$STATE_FILE" || true)"
+    fi
+
+    # If no domain yet, prompt for one
+    if [[ -z "${DOMAIN:-}" ]]; then
+      echo "No domain selected yet."
+      if ! prompt_domain; then
+        echo "No domain chosen; exiting."
+        exit 0
+      fi
+    fi
+
+    echo "Current domain: ${DOMAIN}"
+    echo
+    echo "Select an action:"
+    echo "  1) Surface Scan (whois + basic DNS)"
+    echo "  2) Subdomain Scan (amass + httpx classify)"
+    echo "  3) Change domain"
+    echo "  4) Exit"
+    read -rp "Enter choice [1-4]: " choice
+
+    case "$choice" in
+      1) run_scan 1 ;;
+      2) run_scan 2 ;;
+      3) if ! prompt_domain; then :; fi ;;
+      4) echo "Bye."; exit 0 ;;
+      *) echo "Invalid choice."; sleep 1 ;;
+    esac
+  done
+}
+
+trap 'echo; echo "Interrupted."; exit 130' INT
+
+main() {
+  check_reqs
+  main_menu
+}
+
+main "$@"
