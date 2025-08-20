@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 import argparse
 import subprocess
 import sys
@@ -107,6 +107,23 @@ def parse_dig_answer(text):
             lines.append((name.rstrip("."), "", clas, rtype, rest))
     return lines
 
+# ---------- small helpers ----------
+_ip_re = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+def is_ipv4(s):
+    if not _ip_re.match(s or ""):
+        return False
+    parts = s.split(".")
+    return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+
+def uniq(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
 # ---------- progress helpers ----------
 class StepProgress:
     def __init__(self, domain, total_steps):
@@ -157,13 +174,13 @@ class StepProgress:
 
 # ---------- main scan ----------
 def main():
-    ap = argparse.ArgumentParser(description="makeAcrack scan1 (whois + basic DNS)")
+    ap = argparse.ArgumentParser(description="makeAcrack scan1 (whois + basic DNS + TXT + AXFR + rDNS)")
     ap.add_argument("--domain", required=True, help="Domain to scan, e.g., example.com")
     args = ap.parse_args()
     domain = args.domain.strip()
 
-    # steps: whois, A, MX, NS, CNAME, SOA, parsing -> 7 (saving now optional at the end)
-    steps = StepProgress(domain, total_steps=7)
+    # steps: whois, A, MX, NS, CNAME, SOA, TXT, AXFR, rDNS, parsing -> 10
+    steps = StepProgress(domain, total_steps=10)
 
     # 1) WHOIS
     whois_raw = run(["whois", domain])
@@ -189,13 +206,45 @@ def main():
     dig_soa_raw = run(["dig", "+noall", "+answer", "soa", domain])
     steps.advance("dig SOA")
 
-    # Parse
+    # 7) dig TXT (NEW)
+    dig_txt_raw = run(["dig", "+noall", "+answer", "txt", domain])
+    steps.advance("dig TXT")
+
+    # Parse main sections early
     w = parse_whois(whois_raw)
     a_records = parse_dig_answer(dig_a_raw)
     mx_records = parse_dig_answer(dig_mx_raw)
     ns_records = parse_dig_answer(dig_ns_raw)
     cname_records = parse_dig_answer(dig_cname_raw)
     soa_records = parse_dig_answer(dig_soa_raw)
+    txt_records = parse_dig_answer(dig_txt_raw)
+
+    # nameservers from whois + dig NS
+    ns_from_whois = w.get("nameservers", []) or []
+    ns_from_dig = [rest.rstrip(".") for _,_,_,_,rest in ns_records if rest]
+    all_ns = uniq([ns.rstrip(".") for ns in (ns_from_whois + ns_from_dig)])
+
+    # 8) AXFR attempts (NEW) — try each NS
+    axfr_results = {}          # ns -> {"raw":..., "parsed": [...], "ok": bool}
+    for ns in all_ns:
+        # We do NOT use +noall here to keep diagnostic text in raw; parsed uses our parser.
+        raw = run(["dig", "axfr", f"@{ns}", domain])
+        parsed = parse_dig_answer(raw)
+        ok = bool(parsed) and ("Transfer failed" not in raw) and ("XFR size:" in raw or len(parsed) > 0)
+        axfr_results[ns] = {"raw": raw, "parsed": parsed, "ok": ok}
+    steps.advance("AXFR attempts")
+
+    # 9) Reverse DNS lookups for all A IPs (NEW)
+    ips = [rest for _,_,_,_,rest in a_records if is_ipv4(rest)]
+    ips = uniq(ips)
+    rdns_map = {}  # ip -> {"raw":..., "parsed":[...]}
+    for ip in ips:
+        raw = run(["dig", "+noall", "+answer", "-x", ip])
+        parsed = parse_dig_answer(raw)
+        rdns_map[ip] = {"raw": raw, "parsed": parsed}
+    steps.advance("reverse DNS")
+
+    # 10) parsed & formatted
     steps.advance("parsed & formatted")
 
     # progress complete
@@ -240,9 +289,9 @@ def main():
     if a_records:
         for name, ttl, clas, rtype, rest in a_records:
             print(f"{name}  IN  A  {rest}")
-        ips = [rest for _,_,_,_,rest in a_records]
+        ips_only = [rest for _,_,_,_,rest in a_records]
         print(color("\nInterpretation:", CYAN))
-        print(f"- The domain resolves to: {', '.join(ips)}")
+        print(f"- The domain resolves to: {', '.join(ips_only)}")
     else:
         print("No A records found.")
     print()
@@ -291,6 +340,89 @@ def main():
             print(f"{name}  IN  SOA  {rest}")
         print()
 
+    # DIG TXT (NEW)
+    print(color("Dig (TXT record)", BOLD))
+    if txt_records:
+        for name, ttl, clas, rtype, rest in txt_records:
+            print(f"{name}  IN  TXT  {rest}")
+        # Simple hints for common records
+        txt_values = " ".join([rest.lower() for *_, rest in txt_records])
+        hints = []
+        if "v=spf1" in txt_values:
+            hints.append("SPF")
+        if "v=dkim1" in txt_values:
+            hints.append("DKIM")
+        if "v=dmarc1" in txt_values:
+            hints.append("DMARC")
+        providers = []
+        for marker, label in [
+            ("spf.protection.outlook.com", "Microsoft 365"),
+            ("_spf.google.com", "Google Workspace"),
+            ("sendgrid.net", "SendGrid"),
+            ("spf.mailgun.org", "Mailgun"),
+            ("spf.mandrillapp.com", "Mandrill"),
+            ("spf.sparkpostmail.com", "SparkPost"),
+            ("amazonses.com", "Amazon SES"),
+            ("mailchimp.com", "Mailchimp"),
+            ("spf.fastmail.com", "Fastmail"),
+        ]:
+            if marker in txt_values:
+                providers.append(label)
+        print(color("\nInterpretation:", CYAN))
+        if hints:
+            print(f"- Detected policies: {', '.join(hints)}")
+        if providers:
+            print(f"- Likely email/service providers: {', '.join(uniq(providers))}")
+        if not hints and not providers:
+            print("- TXT records present; review above for additional service hints.")
+    else:
+        print("No TXT records found.")
+    print()
+
+    # AXFR results (NEW)
+    print(color("AXFR (Zone Transfer) Attempts", BOLD))
+    if not all_ns:
+        print("No nameservers discovered to attempt AXFR.")
+    else:
+        any_ok = False
+        for ns in all_ns:
+            res = axfr_results.get(ns, {})
+            ok = res.get("ok", False)
+            status = color("SUCCESS (zone transferred!)", GREEN) if ok else color("refused/failed", YELLOW)
+            print(f"@{ns}: {status}")
+            # If successful, show a few lines to avoid huge dumps on screen
+            if ok:
+                any_ok = True
+                parsed = res.get("parsed", [])[:10]
+                for name, ttl, clas, rtype, rest in parsed:
+                    print(f"  {name} {clas} {rtype} {rest}")
+                if len(res.get("parsed", [])) > 10:
+                    print("  ... (truncated)")
+        if not any_ok:
+            print(color("No zones transferred. (This is the secure/expected case.)", CYAN))
+    print()
+
+    # Reverse DNS (NEW)
+    print(color("Reverse DNS (PTR) for A-record IPs", BOLD))
+    if not ips:
+        print("No A-record IPs to reverse-resolve.")
+    else:
+        for ip in ips:
+            entries = rdns_map.get(ip, {}).get("parsed", [])
+            if entries:
+                # dig -x answer typically shows e.g. 4.3.2.1.in-addr.arpa.  IN PTR host.example.
+                ptrs = [rest.rstrip(".") for _,_,_,rtype,rest in entries if rtype.upper() == "PTR"]
+                if ptrs:
+                    for ptr in ptrs:
+                        print(f"{ip}  IN  PTR  {ptr}")
+                else:
+                    # Fallback: print raw parsed
+                    for name, ttl, clas, rtype, rest in entries:
+                        print(f"{ip}  ->  {name} {clas} {rtype} {rest}")
+            else:
+                print(f"{ip}  ->  (no PTR found)")
+    print()
+
     # Quick notes
     cdn_like = any("cloudflare" in ns.lower() for ns in w.get("nameservers", []))
     print(color("Quick Notes", BOLD))
@@ -304,6 +436,9 @@ def main():
     else:
         print("- DNSSEC: unsigned (no DNSSEC protection).")
 
+    if any(v.get("ok") for v in axfr_results.values()):
+        print(color("- WARNING: Zone transfer (AXFR) succeeded for at least one NS — fix immediately.", RED))
+
     # ----- Ask whether to save raw outputs (default: No) -----
     choice = input("\nDo you want to save raw outputs? (default = No) [1/yes to save]: ").strip().lower()
     if choice in ("1", "yes", "y"):
@@ -316,6 +451,16 @@ def main():
         save_text(os.path.join(outdir, "dig_NS.txt"), dig_ns_raw)
         save_text(os.path.join(outdir, "dig_CNAME.txt"), dig_cname_raw)
         save_text(os.path.join(outdir, "dig_SOA.txt"), dig_soa_raw)
+        save_text(os.path.join(outdir, "dig_TXT.txt"), dig_txt_raw)
+        # AXFR dumps per NS
+        if axfr_results:
+            for ns, res in axfr_results.items():
+                safe_ns = ns.replace("/", "_")
+                save_text(os.path.join(outdir, f"axfr_{safe_ns}.txt"), res.get("raw", ""))
+        # Reverse DNS per IP
+        if rdns_map:
+            for ip, res in rdns_map.items():
+                save_text(os.path.join(outdir, f"rdns_{ip}.txt"), res.get("raw", ""))
         print(color(f"\nRaw outputs saved to: {outdir}", GREEN))
     else:
         print(color("\nResults not saved.", YELLOW))

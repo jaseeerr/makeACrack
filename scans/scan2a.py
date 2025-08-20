@@ -10,6 +10,12 @@ Classify subdomains as Active vs Inactive using ProjectDiscovery httpx.
 Active = any observed 200 OK where title doesn't look like an error page.
 Inactive = otherwise (5xx/4xx, 200 with error-like title, 404, unparsed).
 
+Improvements:
+- Probe more ports by default (common web + frequently exposed service ports).
+- TLS probing enabled (-tls-probe) to extract CN/SANs and related metadata.
+- Favicon hashing enabled (-favicon) to support infra fingerprinting.
+- Response headers collected (-header) to leak tech stack details.
+
 Usage:
   python3 scan2a.py /path/to/subdomains.txt
 """
@@ -23,7 +29,18 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-HTTPX_DEFAULT_PORTS = "80,443,8080,8443,8000,3000"
+# Expanded default port set: common web + often exposed service/admin ports.
+# (httpx will still attempt HTTP(S); many admin panels listen on these.)
+HTTPX_DEFAULT_PORTS = ",".join([
+    # common web
+    "80","443","8080","8443","8000","3000","8888","5000","7001","9443",
+    # mail/ftp/ssh (sometimes web/UIs or proxies on these)
+    "21","22","25",
+    # DBs / search / caches (often-adjacent web dashboards)
+    "3306","5432","6379","9200","9300","27017",
+    # misc admin
+    "15672","15692","2181","5601","9000","9001"
+])
 
 ERROR_TITLE_PATTERNS = [
     r"\b404\b",
@@ -73,6 +90,10 @@ def run_httpx_stream_json(subdomains_file: Path, ports: str) -> Iterable[Dict]:
         "-ip",
         "-td",
         "-p", ports,
+        # Improvements below
+        "-tls-probe",     # scrape TLS certs (CN/SANs, etc.)
+        "-favicon",       # download & mmh3-hash favicon
+        "-header",        # include response headers
     ]
     logging.info(f"[makeAcrack] running: {' '.join(cmd)}")
     try:
@@ -102,33 +123,53 @@ def run_httpx_stream_json(subdomains_file: Path, ports: str) -> Iterable[Dict]:
     if proc.returncode not in (0,):
         logging.warning(f"[makeAcrack] httpx exited with code {proc.returncode}")
 
+def _first_present(d: Dict, keys: List[str], default=None):
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return default
+
+def _intish(v) -> Optional[int]:
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.isdigit():
+        return int(v)
+    return None
+
 def extract_from_json_obj(obj: Dict) -> Dict:
     """
-    Normalize httpx JSON to: {url, codes:[int], title}
+    Normalize httpx JSON to at least: {url, codes:[int], title}
+    Also enrich with (when present):
+      - headers: Dict[str, str]  (response headers)
+      - favicon_hash: str        (mmh3 hash)
+      - tls: Dict[str, Any]      (selected TLS fields: cn, dns_names, issuer, version)
+      - ip: str
+      - tech: List[str]
     """
-    url = obj.get("url") or obj.get("host") or obj.get("input") or ""
-    title = obj.get("title") or obj.get("web-title") or obj.get("page_title") or ""
+    url = _first_present(obj, ["url", "host", "input"], "")
+    title = _first_present(obj, ["title", "web-title", "page_title"], "")
+
+    # status codes (primary + redirect chain)
     codes: List[int] = []
-
     possible_code_keys = ["status_code", "status-code", "status", "final_status_code"]
-    for k in possible_code_keys:
-        v = obj.get(k)
-        if isinstance(v, int):
-            codes = [v]; break
-        if isinstance(v, str) and v.isdigit():
-            codes = [int(v)]; break
+    v = _first_present(obj, possible_code_keys)
+    vi = _intish(v)
+    if vi is not None:
+        codes = [vi]
 
-    # Include redirect chain codes if present
+    # Include redirect/history chain codes if present
     for chain_key in ["chain", "redirect_chain", "history"]:
         chain = obj.get(chain_key)
         if isinstance(chain, list):
             for hop in chain:
-                for k in possible_code_keys:
-                    v = (hop or {}).get(k)
-                    if isinstance(v, int):
-                        codes.append(v)
-                    elif isinstance(v, str) and v.isdigit():
-                        codes.append(int(v))
+                if isinstance(hop, dict):
+                    vi2 = None
+                    for k in possible_code_keys:
+                        vi2 = _intish(hop.get(k))
+                        if vi2 is not None:
+                            break
+                    if vi2 is not None:
+                        codes.append(vi2)
 
     # Dedup while preserving order
     if codes:
@@ -138,7 +179,47 @@ def extract_from_json_obj(obj: Dict) -> Dict:
                 dedup.append(c); seen.add(c)
         codes = dedup
 
-    return {"url": url, "codes": codes, "title": title}
+    # Enrichments (keys vary across httpx versions; try several)
+    # Headers
+    headers = obj.get("response-headers") or obj.get("headers") or obj.get("response_headers") or {}
+
+    # Favicon hash (mmh3)
+    favicon_hash = _first_present(obj, ["favicon-hash", "favicon_hash", "favicon_mmh3_hash", "faviconmmh3"], "")
+
+    # TLS info
+    tls_obj = obj.get("tls") or obj.get("tls-grab") or obj.get("tlsinfo") or {}
+    # Normalize TLS fields that are commonly present
+    tls_cn = _first_present(tls_obj, ["cn", "common_name", "subject_cn", "subjectCN"], "")
+    tls_sans = _first_present(tls_obj, ["dns_names", "san", "subject_alt_names", "names"], [])
+    if isinstance(tls_sans, str):
+        # sometimes comma/space-separated
+        tls_sans = [s.strip() for s in re.split(r"[,\s]+", tls_sans) if s.strip()]
+    issuer = _first_present(tls_obj, ["issuer", "issuer_dn", "issuerDN"], "")
+    tls_version = _first_present(tls_obj, ["version", "tls_version"], "")
+
+    # Tech stack (from -td / technology detection)
+    tech = obj.get("tech") or obj.get("technologies") or []
+    if isinstance(tech, str):
+        tech = [t.strip() for t in tech.split(",") if t.strip()]
+
+    # IP
+    ip = obj.get("ip") or obj.get("a") or ""
+
+    return {
+        "url": url,
+        "codes": codes,
+        "title": title,
+        "headers": headers if isinstance(headers, dict) else {},
+        "favicon_hash": favicon_hash or "",
+        "tls": {
+            "cn": tls_cn,
+            "dns_names": tls_sans if isinstance(tls_sans, list) else [],
+            "issuer": issuer,
+            "version": tls_version,
+        },
+        "ip": ip,
+        "tech": tech if isinstance(tech, list) else [],
+    }
 
 # =========================
 # TEXT FALLBACK PARSER
@@ -147,6 +228,7 @@ def parse_httpx_text_line(line: str) -> Dict:
     """
     Parse a non-JSON httpx line robustly:
       <url> [codes] [title] [ip] [tech] [redirect]
+    (Fallback only; JSON path is primary and already includes improvements.)
     """
     raw = strip_ansi(line.rstrip("\n"))
     if not raw.strip():
@@ -233,7 +315,7 @@ def main():
         is_active = classify(entry)
         (active if is_active else inactive).append(entry)
 
-    # Print results to screen
+    # Print results to screen (unchanged format)
     def fmt_codes(codes: List[int]) -> str:
         return ",".join(str(c) for c in codes) if codes else "—"
 
@@ -251,7 +333,7 @@ def main():
         for e in inactive:
             print(f"- {e['url']}  [{fmt_codes(e.get('codes', []))}]  [{e.get('title') or '—'}]")
 
-    # Ask whether to save
+    # Ask whether to save (same behavior; saves URL lists only to avoid breaking workflows)
     if ask_yes("\nDo you want to save these ACTIVE/INACTIVE lists?"):
         active_path = out_dir / "active_subdomains.txt"
         inactive_path = out_dir / "inactive_subdomains.txt"
