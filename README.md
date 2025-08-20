@@ -57,7 +57,7 @@ Results are saved in results/<domain>/<timestamp>/.
 
 🧩 Example Workflow
 ./run
-# enter: syntegrateitsolutions.com
+enter: domain.com
 
 
 Output files:
